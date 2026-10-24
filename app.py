@@ -1,9 +1,11 @@
-from io import BytesIO
+import hashlib
+import traceback
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from analytics import (ALIASES, REQUIRED, demo_data, read_report, infer_mapping,
-                       normalize, daily_summary, ranking, signals, export_excel)
+                       normalize, daily_summary, ranking, signals, export_excel,
+                       list_sheets, load_grid, detect_header, report_from_grid, fill_merged_text)
 
 st.set_page_config(page_title='Temu 采购订单分析', page_icon='📊', layout='wide')
 st.title('Temu 全托管采购订单分析')
@@ -24,12 +26,30 @@ try:
     else:
         data = uploaded.getvalue()
         sheet = 0
+        upload_key = hashlib.sha256(data).hexdigest()[:16]
         if uploaded.name.lower().endswith(('.xlsx', '.xls')):
-            sheets = pd.ExcelFile(BytesIO(data)).sheet_names
-            sheet = st.sidebar.selectbox('工作表', sheets)
-        raw = read_report(data, uploaded.name, sheet)
+            sheet = st.sidebar.selectbox('工作表', list_sheets(data, uploaded.name), key=f'sheet_{upload_key}')
+        grid = load_grid(data, uploaded.name, sheet)
+        if grid.empty:
+            st.info('所选工作表为空，请选择其他工作表。')
+            st.stop()
+        with st.expander('读取诊断与原始表格（选择表头前）', expanded=True):
+            st.caption('左侧行号为文件实际行号。合并单元格只保留左上角原值，不自动填充采购数量或金额。')
+            preview = grid.head(50).copy()
+            preview.index = preview.index + 1
+            preview.columns = [f'列{i+1}' for i in range(len(preview.columns))]
+            st.dataframe(preview.fillna('').astype(str))
+            for message in grid.attrs.get('diagnostics', []):
+                st.code(message)
+            header = st.number_input('表头所在行（文件实际行号）', min_value=1, max_value=len(grid),
+                                     value=detect_header(grid)+1, step=1, key=f'header_{upload_key}_{sheet}')
+            layers = st.number_input('表头层数（单行选1，多层合并表头可选2至5）', min_value=1, max_value=min(5, len(grid)-header+1), value=1, step=1, key=f'layers_{upload_key}_{sheet}_{header}')
+            st.caption('自动识别前50行；可手动修改实际行号。多层表头将分组空白向右补全并拼接字段名；请核对映射。数据中的合并空白不填充，避免重复计算。')
+        raw = report_from_grid(grid, header-1, layers)
 except Exception as exc:
-    st.error(f'文件读取失败，请检查文件格式、编码及是否加密：{exc}')
+    st.error(f'文件读取失败：{type(exc).__name__}: {exc}。请选择正确工作表/表头；若为损坏或加密文件，请用Excel打开后另存为.xlsx。')
+    with st.expander('具体错误位置（排查用）'):
+        st.code(traceback.format_exc())
     st.stop()
 if raw.empty:
     st.info('报表没有数据行。')
@@ -43,13 +63,18 @@ with st.expander('原始数据预览与字段匹配', expanded=True):
     columns = st.columns(3)
     for i, field in enumerate(ALIASES):
         mapping[field] = columns[i % 3].selectbox(field + (' *' if field in REQUIRED else '（可选）'), options,
-              index=options.index(detected[field]), format_func=lambda x: '未匹配' if x is None else str(x), key=f'map_{field}')
+              index=options.index(detected[field]), format_func=lambda x: '未匹配' if x is None else str(x), key=f'map_{field}_{hashlib.sha256(str(list(raw.columns)).encode()).hexdigest()[:12]}')
+fill_text = st.checkbox('按Excel真实纵向合并区域补全订单号、SKU、条码及文本属性（不补数量/单价）', value=False)
+if fill_text:
+    raw = fill_merged_text(raw, mapping)
 try:
     valid, rejected = normalize(raw, mapping)
-except (ValueError, TypeError) as exc:
-    st.error(str(exc))
+except Exception as exc:
+    st.error(f'字段解析失败：{type(exc).__name__}: {exc}')
+    with st.expander('具体错误位置（排查用）'):
+        st.code(traceback.format_exc())
     st.stop()
-st.caption(f'读取 {len(raw)} 行；有效 {len(valid)} 行；无效 {len(rejected)} 行。源数据行以首行为表头计数。')
+st.caption(f'读取 {len(raw)} 行；有效 {len(valid)} 行；无效 {len(rejected)} 行。源数据行保留文件实际行号；全空行已跳过。')
 if not rejected.empty:
     with st.expander('查看无效数据（不纳入分析）'):
         st.dataframe(rejected, hide_index=True)
@@ -114,8 +139,14 @@ with tabs[3]:
                 ('订单计数', '按唯一订单号统计；每日按当日去重' if has_id else '未提供订单号，仅统计明细行'),
                 ('日期范围', f'{start:%Y-%m-%d} 至 {end:%Y-%m-%d}'), ('纳入状态', '、'.join(selected)),
                 ('币种/单位', currency), ('缺失日期', '观察范围内补0，不证明实际无采购'),
-                ('金额公式', '数量×供货单价；每行保留2位后求和'), ('重复数据', '不自动删除重复行'),
+                ('金额公式', '数量×供货单价；每行保留2位后求和'), ('重复数据', '不自动删除重复行'), ('合并文本补全', '已启用，仅原始纵向合并文本区域' if fill_text else '未启用'),
                 ('无效数据', f'{len(rejected)}行已排除；导出无效数据表包含整个上传文件的无效行'),
                 ('增长异常规则', '7/30天等长环比；偏离此前7日均值超过3倍标准差且至少5件')]
-    st.download_button('导出 Excel 分析结果', export_excel(frame, daily, changes, anomalies, rejected, metadata),
-                       'Temu采购订单分析.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    try:
+        result = export_excel(frame, daily, changes, anomalies, rejected, metadata)
+        st.download_button('导出 Excel 分析结果', result, 'Temu采购订单分析.xlsx',
+                           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    except Exception as exc:
+        st.error(f'Excel导出失败：{type(exc).__name__}: {exc}')
+        with st.expander('导出错误位置'):
+            st.code(traceback.format_exc())
